@@ -1,0 +1,144 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
+out_dir = "figs"
+os.makedirs(out_dir, exist_ok=True)
+
+train = pd.read_csv("2025-travelers-umc-umn/Training_TriGuard.csv")
+test = pd.read_csv("2025-travelers-umc-umn/Testing_TriGuard.csv")
+
+target_col = "subrogation"
+train = train.dropna(subset=[target_col]).reset_index(drop=True)
+
+y = train[target_col]
+X = train.drop(columns=[target_col])
+
+for df in (X, test):
+    df["claim_date"] = pd.to_datetime(df["claim_date"])
+    df["claim_year"] = df["claim_date"].dt.year
+    df["claim_month"] = df["claim_date"].dt.month
+    df.drop(columns=["claim_date"], inplace=True)
+
+    if "year_of_born" in df.columns:
+        invalid_yob = (df["year_of_born"] < 1900) | (df["year_of_born"] > df["claim_year"])
+        df.loc[invalid_yob, "year_of_born"] = np.nan
+        df["driver_age"] = df["claim_year"] - df["year_of_born"]
+        invalid_age = (df["driver_age"] < 16) | (df["driver_age"] > 100)
+        df.loc[invalid_age, "driver_age"] = np.nan
+
+cat_cols = X.select_dtypes(include=["object"]).columns.tolist()
+num_cols = [c for c in X.columns if c not in cat_cols]
+
+print("cat：", cat_cols)
+print("num：", num_cols)
+
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+numeric_transformer = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+    ]
+)
+
+categorical_transformer = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ]
+)
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, num_cols),
+        ("cat", categorical_transformer, cat_cols),
+    ]
+)
+
+preprocess.fit(X_train)
+
+X_train_proc = preprocess.transform(X_train)
+X_valid_proc = preprocess.transform(X_valid)
+X_test_proc = preprocess.transform(test)
+
+feature_names = preprocess.get_feature_names_out()
+
+X_train_proc_df = pd.DataFrame(
+    X_train_proc.toarray() if hasattr(X_train_proc, "toarray") else X_train_proc,
+    columns=feature_names,
+)
+X_valid_proc_df = pd.DataFrame(
+    X_valid_proc.toarray() if hasattr(X_valid_proc, "toarray") else X_valid_proc,
+    columns=feature_names,
+)
+X_test_proc_df = pd.DataFrame(
+    X_test_proc.toarray() if hasattr(X_test_proc, "toarray") else X_test_proc,
+    columns=feature_names,
+)
+
+print("X_train_proc_df shape:", X_train_proc_df.shape)
+print("X_valid_proc_df shape:", X_valid_proc_df.shape)
+print("X_test_proc_df shape:", X_test_proc_df.shape)
+
+X_train_proc_df.to_csv("X_train_proc.csv", index=False)
+X_valid_proc_df.to_csv("X_valid_proc.csv", index=False)
+X_test_proc_df.to_csv("X_test_proc.csv", index=False)
+y_train.to_csv("y_train.csv", index=False)
+y_valid.to_csv("y_valid.csv", index=False)
+
+train_clean = X.copy()
+train_clean[target_col] = y
+
+plt.figure(figsize=(4, 3))
+sns.countplot(data=train_clean, x=target_col)
+plt.tight_layout()
+plt.savefig(os.path.join(out_dir, "subrogation_count.png"))
+plt.show()
+plt.close()
+
+num_for_plot = [
+    col for col in ["driver_age", "liab_prct", "vehicle_price", "past_num_of_claims", "claim_est_payout"]
+    if col in train_clean.columns
+]
+
+for col in num_for_plot:
+    plt.figure(figsize=(5, 4))
+    sns.kdeplot(data=train_clean, x=col, hue=target_col, common_norm=False)
+    plt.tight_layout()
+    fname = f"num_{col}_kde.png"
+    plt.savefig(os.path.join(out_dir, fname))
+    plt.show()
+    plt.close()
+
+cat_for_plot = []
+for col in cat_cols:
+    if col in train_clean.columns:
+        nunique = train_clean[col].nunique(dropna=True)
+        if 2 <= nunique <= 8:
+            cat_for_plot.append(col)
+
+for i, col in enumerate(cat_for_plot):
+    tmp = (
+        pd.crosstab(train_clean[col], train_clean[target_col], normalize="index")
+        .stack()
+        .reset_index(name="ratio")
+    )
+    plt.figure(figsize=(6, 4))
+    sns.barplot(data=tmp, x=col, y="ratio", hue=target_col)
+    plt.ylim(0, 1)
+    plt.xticks(rotation=30, ha="right")
+    plt.tight_layout()
+    fname = f"cat_{i:02d}_{col}_ratio.png"
+    plt.savefig(os.path.join(out_dir, fname))
+    plt.show()
+    plt.close()
+
