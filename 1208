@@ -1,0 +1,163 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score, f1_score
+from sklearn.ensemble import GradientBoostingClassifier
+import warnings
+
+warnings.filterwarnings('ignore')
+out_dir = "figs"
+os.makedirs(out_dir, exist_ok=True)
+train = pd.read_csv("2025-travelers-umc-umn/Training_TriGuard.csv")
+test = pd.read_csv("2025-travelers-umc-umn/Testing_TriGuard.csv")
+target_col = "subrogation"
+train = train.dropna(subset=[target_col]).reset_index(drop=True)
+y = train[target_col]
+X = train.drop(columns=[target_col])
+
+for df in (X, test):
+    df["claim_date"] = pd.to_datetime(df["claim_date"])
+    df["claim_year"] = df["claim_date"].dt.year
+    df["claim_month"] = df["claim_date"].dt.month
+    df.drop(columns=["claim_date"], inplace=True)
+
+    if "year_of_born" in df.columns:
+        invalid_yob = (df["year_of_born"] < 1900) | (df["year_of_born"] > df["claim_year"])
+        df.loc[invalid_yob, "year_of_born"] = np.nan
+        df["driver_age"] = df["claim_year"] - df["year_of_born"]
+        invalid_age = (df["driver_age"] < 16) | (df["driver_age"] > 100)
+        df.loc[invalid_age, "driver_age"] = np.nan
+    if "vehicle_made_year" in df.columns:
+        df["vehicle_age"] = (df["claim_year"] - df["vehicle_made_year"]).clip(0, 50)
+    if "claim_est_payout" in df.columns and "vehicle_price" in df.columns:
+        df["loss_ratio"] = (df["claim_est_payout"] / df["vehicle_price"].replace(0, np.nan)).clip(0, 5)
+    if "claim_est_payout" in df.columns:
+        df["log_claim_payout"] = np.log1p(df["claim_est_payout"])
+
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+global_mean = y_train.mean()
+tmp_train = X_train.copy()
+tmp_train[target_col] = y_train.values
+zip_stats = tmp_train.groupby("zip_code")[target_col].agg(["mean", "count"])
+alpha = 20.0
+zip_stats["zip_risk"] = (
+        (zip_stats["mean"] * zip_stats["count"] + global_mean * alpha) /
+        (zip_stats["count"] + alpha)
+)
+
+zip_risk_map = zip_stats["zip_risk"].to_dict()
+
+for df in [X_train, X_valid, X, test]:
+    df["zip_risk"] = df["zip_code"].map(zip_risk_map).fillna(global_mean)
+    df.drop(columns=["zip_code"], inplace=True)
+
+cat_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
+num_cols = [c for c in X_train.columns if c not in cat_cols and c != "claim_number"]
+
+preprocessor = ColumnTransformer([
+    ("num", SimpleImputer(strategy="median"), num_cols),
+    ("cat", Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ]), cat_cols),
+])
+
+preprocessor.fit(X_train)
+X_train_proc = preprocessor.transform(X_train)
+X_valid_proc = preprocessor.transform(X_valid)
+X_test_proc = preprocessor.transform(test)
+y_train_bin = y_train.astype(int)
+y_valid_bin = y_valid.astype(int)
+
+configs = {
+    'config1_shallow': {
+        "learning_rate": 0.05,
+        "n_estimators": 400,
+        "max_depth": 3,
+        "subsample": 0.8,
+        "max_features": 0.8,
+        "random_state": 42
+    },
+    'config2_deeper': {
+        "learning_rate": 0.05,
+        "n_estimators": 600,
+        "max_depth": 4,
+        "subsample": 0.8,
+        "max_features": 0.8,
+        "min_samples_leaf": 30,
+        "random_state": 42
+    },
+    'config3_regularized': {
+        "learning_rate": 0.03,
+        "n_estimators": 800,
+        "max_depth": 3,
+        "subsample": 0.7,
+        "max_features": 0.7,
+        "min_samples_leaf": 50,
+        "random_state": 42
+    }
+}
+
+best_f1 = 0
+best_config_name = None
+best_model = None
+best_threshold = 0.5
+
+for name, params in configs.items():
+    print(f"\n  {name}:")
+    model = GradientBoostingClassifier(**params)
+    model.fit(X_train_proc, y_train_bin)
+    valid_pred = model.predict_proba(X_valid_proc)[:, 1]
+    auc = roc_auc_score(y_valid_bin, valid_pred)
+    best_t = 0.5
+    best_f1_config = 0.0
+    for t in np.linspace(0.1, 0.9, 161):
+        preds = (valid_pred >= t).astype(int)
+        score = f1_score(y_valid_bin, preds)
+        if score > best_f1_config:
+            best_f1_config = score
+            best_t = t
+
+    print(f" AUC: {auc:.4f} | F1: {best_f1_config:.4f} @ threshold={best_t:.3f}")
+
+    if best_f1_config > best_f1:
+        best_f1 = best_f1_config
+        best_config_name = name
+        best_model = model
+        best_threshold = best_t
+
+print(f"BEST CONFIGURATION: {best_config_name}")
+print(f"F1:  {best_f1:.4f}")
+print(f"Best Threshold: {best_threshold:.3f}")
+
+test_pred_proba = best_model.predict_proba(X_test_proc)[:, 1]
+test_pred_label = (test_pred_proba >= best_threshold).astype(int)
+
+submission = pd.DataFrame({
+    "claim_number": test["claim_number"],
+    "subrogation": test_pred_label
+})
+
+save_path = "submission_1208.csv"
+submission.to_csv(save_path, index=False)
+
+print(f"Saved: {save_path}")
+print(f"  Test positive rate: {test_pred_label.mean():.4f}")
+print(f"  LightGBM baseline:  Valid F1 ≈ 0.5690, Test ≈ 0.59385")
+print(f"  Current model:  Valid F1 = {best_f1:.4f}, Est Test = {estimated_test_f1:.4f}")
+print(f"  Expected improvement:   {estimated_test_f1 - 0.59385:+.4f}")
+
+if estimated_test_f1 > 0.59385:
+    print(f"Estimated improvement: {estimated_test_f1 - 0.59385:+.4f}")
+elif estimated_test_f1 > 0.593:
+    print(f"Marginal improvement")
+else:
+    print(f"Not improve")
