@@ -100,10 +100,10 @@ def feature_engineering(raw_df: pd.DataFrame, is_train: bool = True) -> pd.DataF
         if col in df.columns:
             df[col] = np.log1p(df[col])
 
-    df["years_norm"] = (df["driver_years"] - df["driver_years"].mean()) / (
-                df["driver_years"].max() - df["driver_years"].min())
+    df["years_norm"] = (df["driver_ability"] - df["driver_ability"].mean()) / (
+                df["driver_ability"].max() - df["driver_ability"].min())
     df["safety_norm"] = (df["safety_rating"] - df["safety_rating"].mean()) / (
-                df["safety_rating"].max() - df["driver_years"].min())
+                df["safety_rating"].max() - df["safety_rating"].min())
     df["claims_norm"] = (df["past_num_of_claims_cap"] - df["past_num_of_claims_cap"].mean()) / (
                 df["past_num_of_claims_cap"].max() - df["past_num_of_claims_cap"].min())
 
@@ -112,6 +112,9 @@ def feature_engineering(raw_df: pd.DataFrame, is_train: bool = True) -> pd.DataF
             0.4 * (1 - df["safety_norm"]) +
             0.2 * df["claims_norm"]
     )
+
+    annual_rate = 0.12  # 12% per year
+    mile_rate = 0.000002  # value loss per mile
 
     df['vehicle_depr_value'] = (
             df['vehicle_price'] *
